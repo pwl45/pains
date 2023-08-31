@@ -1,27 +1,23 @@
 extern crate rand;
+extern crate regex;
 use thiserror::Error;
 use reqwest::header;
-use std::collections::HashMap;
-use rand::Rng;
 use rand::seq::SliceRandom;
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
 use strum_macros::Display;
 
-const STOCK_FNS: [for<'a> fn(&'a Stock) -> Result<String, StockScrapeError>; 5] = [
-    get_price_salpha,
-    get_price_googfin,
-    get_price_yahoo,
-    get_price_bloomberg,
-    get_price_cnbc,
-];
+use regex::Regex;
 
-struct StockSource <'a> {
+struct StockSource {
     id: SourceID,
     base_url: String,
-    url_transformer: Box<dyn Fn(&str, &Stock) -> String>,
-    result_transformer: Box<dyn Fn(&str) -> String>,
-    selectors: Vec<&'a str>,
+    url_transformer: fn(&str, &Stock) -> Result<String, StockScrapeError>,
+    price_selectors: Vec<String>,
+    price_result_transformer: fn(&str) -> String,
+    // pct_ch_selectors: Vec<&'a str>,
+    pct_ch_selectors: fn(&Stock) -> Vec<String>,
+    pct_ch_result_transformer: Box<dyn Fn(&str) -> String>,
     needs_exchange: bool,
 }
 
@@ -33,6 +29,17 @@ enum SourceID {
     WallStreetJournal,
     CNBC,
     Bloomberg,
+}
+
+enum AttrID {
+    Price,
+    PctCh,
+}
+
+struct AttrGettr {
+    attr_id: AttrID,
+    get_selectors: fn(&Stock) -> Vec<String>,
+    result_transformer: fn(&str) -> String,
 }
 
 struct Stock {
@@ -79,187 +86,190 @@ pub enum AggregatedError {
 }
 
 // Just try one selector
-fn get_price_simple_selector<F>(
-    // ticker: &str,
-    full_url: &str,
-    selector: &str,
-    mapper: F
-) -> Result<String, StockScrapeError>
-where
-    F: FnOnce(&str) -> String,
-{
-    get_price_multiple_selector(full_url,&vec![selector],mapper)
-}
+// fn get_price_simple_selector<F>(
+//     // ticker: &str,
+//     full_url: &str,
+//     selector: &str,
+//     mapper: F
+// ) -> Result<String, StockScrapeError>
+// where
+//     F: FnOnce(&str) -> String,
+// {
+//     get_price_multiple_selector(full_url,&vec![selector.to_string()],mapper)
+// }
 
 // Try multiple selectors and return the first match
-fn get_price_multiple_selector<F>(
-    // ticker: &str,
-    full_url: &str,
-    selectors: &Vec<&str>, 
-    mapper: F
-) -> Result<String, StockScrapeError>
-where
-    F: FnOnce(&str) -> String,
-{
+fn get_document(url:&str) -> Result<scraper::Html,StockScrapeError>{
+
     let client = reqwest::blocking::Client::new();
-    println!("{}",full_url);
-    let response=client.get(full_url).header(header::USER_AGENT,"Mozilla/5.0 (X11; Linux x86_64; rv:60.0) Gecko/20100101 Firefox/81.0").send()
+    println!("{}",url);
+    let response=client.get(url).header(header::USER_AGENT,"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36").send()
         .map_err(StockScrapeError::FetchError)?
         .text()
         .map_err(StockScrapeError::ReadError)?;
 
-    let document = scraper::Html::parse_document(&response);
-    // println!("{}",response);
+    return Ok(scraper::Html::parse_document(&response));
+}
 
-    for selector in selectors {
+
+fn get_price_multiple_selector<F>(
+    document: &scraper::Html,
+    price_selectors: &Vec<String>, 
+    price_selectors_transformer: F
+) -> Result<String, StockScrapeError>
+where
+    F: FnOnce(&str) -> String,
+{
+    for selector in price_selectors {
         let title_selector = scraper::Selector::parse(selector)
             .map_err(|_| StockScrapeError::SelectorParseError)?;
 
         if let Some(element) = document.select(&title_selector).next() {
             let result = element.text().collect::<String>();
-            return Ok(mapper(&result));
+            return Ok(price_selectors_transformer(&result));
         }
 
     }
     Err(StockScrapeError::NoMatchError)
 }
 
-fn get_price_yahoo(s: &Stock) -> Result<String, StockScrapeError> {
-    let base_url="https://finance.yahoo.com/quote/";
-    let full_url = format!("{}{}/", base_url, s.ticker);
-    let selector="fin-streamer.Fw\\(b\\).Fz\\(36px\\).Mb\\(-4px\\).D\\(ib\\)";
-    
-    return get_price_simple_selector(&full_url, selector, |s: &str| s.to_string());
-}
-
-fn get_price_salpha(s: &Stock) -> Result<String, StockScrapeError> {
-    let base_url="https://seekingalpha.com/symbol/";
-    let full_url = format!("{}{}/", base_url, s.ticker);
-    let selectors = vec![
-        r#"[data-test-id="symbol-price"]"#,
-    ];
-
-    return get_price_multiple_selector(&full_url, &selectors, |s: &str| s.replace("$", ""));
-}
-
-fn get_price_googfin(s: &Stock) -> Result<String, StockScrapeError> {
-    let exchange: &String = s.exchange.as_ref().ok_or(StockScrapeError::NoExchangeError)?;
-    let base_url="https://www.google.com/finance/quote/";
-    let full_url = format!("{}{}:{}", base_url, s.ticker,exchange);
-    let selector = "div.YMlKec.fxKbKc";
-
-    return get_price_simple_selector(&full_url, selector, |s: &str| s.replace("$", ""));
-}
-
-// todo: revisit during business hours
-fn get_price_cnbc(s: &Stock) -> Result<String, StockScrapeError> {
-    let base_url="https://www.cnbc.com/quotes/";
-    let full_url = format!("{}{}", base_url,s.ticker.to_lowercase());
-    // let selector = "div.QuoteStrip-dataContainer.QuoteStrip-extendedHours > div.QuoteStrip-lastTimeAndPriceContainer > div.QuoteStrip-lastPriceStripContainer > span.QuoteStrip-lastPrice";
-    let selectors = vec![
-        "div.QuoteStrip-dataContainer.QuoteStrip-extendedHours > div.QuoteStrip-lastTimeAndPriceContainer > div.QuoteStrip-lastPriceStripContainer > span.QuoteStrip-lastPrice",
-        "div.QuoteStrip-lastTimeAndPriceContainer > div.QuoteStrip-lastPriceStripContainer > span.QuoteStrip-lastPrice",
-    ];
-
-    return get_price_multiple_selector(&full_url, &selectors , |s: &str| s.replace("$", ""));
-}
-
-fn get_price_wsj(s: &Stock) -> Result<String, StockScrapeError> {
-    let base_url="https://www.wsj.com/market-data/quotes/";
-    let full_url = format!("{}{}", base_url,s.ticker.to_lowercase());
-    let selectors = vec![
-        "span#quote_val",
-    ];
-
-    return get_price_multiple_selector(&full_url, &selectors , |s: &str| s.replace("$", ""));
-}
-
-fn get_price_bloomberg(s: &Stock) -> Result<String, StockScrapeError> {
-    let base_url="https://www.bloomberg.com/quote/";
-    let full_url = format!("{}{}:US", base_url,s.ticker.to_uppercase());
-    // let selector = "div.QuoteStrip-dataContainer.QuoteStrip-extendedHours > div.QuoteStrip-lastTimeAndPriceContainer > div.QuoteStrip-lastPriceStripContainer > span.QuoteStrip-lastPrice";
-    let selectors = vec![
-        // Match anything that has sized-price as one class and SizedPrice_extraLarge* (class that begins with SizedPrice_extraLarge) as a separate class. 
-        r#"div[class~="sized-price"][class*="SizedPrice_extraLarge"]"#
-    ];
-
-    return get_price_multiple_selector(&full_url, &selectors , |s: &str| s.replace("$", ""));
-}
-
-
-fn get_price_robust(s: &Stock, source_map: &HashMap<SourceID, fn(&Stock) -> Result<String, StockScrapeError>>) -> Result<String, StockScrapeError> {
-    let mut sources: Vec<_> = SourceID::iter().collect();
-    // for source in &sources{
-    //     println!("{}",source);
-    // }
-    let mut rng = rand::thread_rng();
-    sources.shuffle(&mut rng);
+fn get_price_robust(s: &Stock, sources: &Vec<StockSource>) -> Result<String, StockScrapeError> {
     let mut errs: Vec<StockScrapeError> = vec![];
-    // for source in &sources{
-    //     println!("{}",source);
-    //     println!("{}",source);
-    // }
-    for source in &sources {
-        if let Some(stock_fn)=source_map.get(source){
-            let result = stock_fn(s);
-            match result {
-                Result::Ok(val) => return Ok(val),
-                Result::Err(err) => errs.push(err),
-            }
-        }else{
-            //TODO: put something here to handle this case... or refactor so that it cant happen. 
+    for source in sources {
+        let result = get_price_source(s,source);
+        match result {
+            Result::Ok(val) => return Ok(val),
+            Result::Err(err) => errs.push(err),
         }
-        // println!("{}",s);
     }
+    // for source in sources {
+    //     println!("{}",source.id);
+    // }
     Err(StockScrapeError::NoMatchError)
 }
 
-fn get_price_Source(s: &Stock, so: &StockSource) -> Result<String, StockScrapeError> {
-    let base_url=&so.base_url;
-    let full_url = (so.url_transformer)(&base_url, &s);
 
-    return get_price_multiple_selector(&full_url, &so.selectors , |s: &str| s.replace("$", ""));
+// fn get_full_price(s: &Stock, so: &StockSource) -> (Result<String, StockScrapeError>, Result<String, StockScrapeError>) {
+//     let full_url = (so.url_transformer)(&so.base_url, &s)?;
+//     let pct_ch_selectors_applied = (so.pct_ch_selectors)(&s);
+//     let document = get_document(&full_url)?;
+
+//     let price_result = get_price_multiple_selector(&document, &so.price_selectors, &so.price_result_transformer);
+//     let pct_ch_result = get_price_multiple_selector(&document, &pct_ch_selectors_applied, &so.pct_ch_result_transformer);
+//     return (price_result, pct_ch_result);
+// }
+
+//TODO: update this function signature to return a pair of Result<String, StockScrapeError>s
+fn get_price_source(s: &Stock, so: &StockSource) -> Result<String, StockScrapeError> {
+    let full_url = (so.url_transformer)(&so.base_url, &s)?;
+    let pct_ch_selectors_applied = (so.pct_ch_selectors)(&s);
+    let document = get_document(&full_url)?;
+
+    return get_price_multiple_selector(&document, &so.price_selectors, &so.price_result_transformer);
+    //TODO: make this return a pair of Result<String, StockScrapeError> using the commented line below
+    // return get_price_multiple_selector(&document, &pct_ch_selectors_applied, &so.pct_ch_result_transformer);
 }
+
+
+fn get_pch_source(s: &Stock, so: &StockSource) -> Result<String, StockScrapeError> {
+    let full_url = (so.url_transformer)(&so.base_url, &s)?;
+    let pct_ch_selectors_applied = (so.pct_ch_selectors)(&s);
+    let document = get_document(&full_url)?;
+    return get_price_multiple_selector(&document, &pct_ch_selectors_applied, &so.pct_ch_result_transformer);
+}
+
 
 fn main() {
-    let mut source_map: HashMap<SourceID, fn(&Stock) -> Result<String, StockScrapeError>> = HashMap::new();
-    let source = StockSource {
+    let mut sources = vec![
+        StockSource {
             id: SourceID::Yahoo,
             base_url: "https://finance.yahoo.com/quote/".to_string(),
-            url_transformer: Box::new(|base_url, stock| format!("{}{}", base_url, stock.ticker)),
-            result_transformer: Box::new(|s| s.replace("$", "")),
-            selectors: vec!["fin-streamer.Fw\\(b\\).Fz\\(36px\\).Mb\\(-4px\\).D\\(ib\\)"],
+            url_transformer: |base_url, stock| Ok(format!("{}{}/", base_url, stock.ticker)),
+            price_result_transformer: |s| s.replace("$", ""),
+            price_selectors: vec!["fin-streamer.Fw\\(b\\).Fz\\(36px\\).Mb\\(-4px\\).D\\(ib\\)".to_string()],
+            pct_ch_selectors: |s: &Stock| {
+                let selector = format!(r#"fin-streamer[data-field="regularMarketChangePercent"][data-symbol="{}"]"#,s.ticker);
+                vec![selector]
+            },
+            pct_ch_result_transformer: Box::new(|s| {
+                let re = Regex::new(r".*\((.*)\)").unwrap();
+
+                if let Some(captured) = re.captures(s) {
+                    if let Some(matched) = captured.get(1) {
+                        // println!("{}", matched.as_str());
+                        return matched.as_str().to_string();
+                    }
+                }
+                return "".to_string();
+            }),
             needs_exchange: false,
-        };
-    source_map.insert(SourceID::GoogleFinance,get_price_googfin);
-    source_map.insert(SourceID::SeekingAlpha,get_price_salpha);
-    source_map.insert(SourceID::Yahoo,get_price_yahoo);
-    source_map.insert(SourceID::Bloomberg,get_price_bloomberg);
-    source_map.insert(SourceID::WallStreetJournal,get_price_wsj);
-    source_map.insert(SourceID::CNBC,get_price_cnbc);
+        },
+        // StockSource {
+        //     id: SourceID::SeekingAlpha,
+        //     base_url: "https://seekingalpha.com/symbol/".to_string(),
+        //     url_transformer: Box::new(|base_url, stock| Ok(format!("{}{}/", base_url, stock.ticker))),
+        //     price_result_transformer: Box::new(|s| {s.replace("$", "")}),
+        //     price_selectors: vec![r#"[data-test-id="symbol-price"]"#,],
+        //     pct_ch_selectors: vec![r#"[data-test-id="symbol-change"]"#,],
+        //     needs_exchange: false,
+        // },
+        //StockSource {
+        //    id: SourceID::GoogleFinance,
+        //    base_url: "https://www.google.com/finance/quote/".to_string(),
+        //    url_transformer: Box::new(|base_url, stock| {
+        //        let exchange_str= stock.exchange.as_ref().ok_or(StockScrapeError::NoExchangeError)?;
+        //        Ok(format!("{}{}:{}", base_url, stock.ticker,exchange_str))
+        //    }),
+        //    price_result_transformer: Box::new(|s| s.replace("$", "")),
+        //    price_selectors: vec!["div.YMlKec.fxKbKc"],
+        //    needs_exchange: true,
+        //},
+        //StockSource {
+        //    id: SourceID::Bloomberg,
+        //    base_url: "https://www.bloomberg.com/quote/".to_string(),
+        //    url_transformer: Box::new(|base_url, stock| Ok(format!("{}{}:US", base_url,stock.ticker.to_uppercase()))),
+        //    price_result_transformer: Box::new(|s| s.replace("$", "")),
+        //    // Match anything that has sized-price as one class and SizedPrice_extraLarge* 
+        //    //(class that begins with SizedPrice_extraLarge) as a separate class. 
+        //    price_selectors: vec![
+        //        r#"div[class~="sized-price"][class*="SizedPrice_extraLarge"]"#
+        //    ],
+        //    needs_exchange:false,
+        //},
+        //StockSource {
+        //    id: SourceID::CNBC,
+        //    base_url: "https://www.cnbc.com/quotes/".to_string(),
+        //    url_transformer: Box::new(|base_url, stock| Ok(format!("{}{}", base_url,stock.ticker.to_lowercase()))),
+        //    price_result_transformer: Box::new(|s| s.replace("$", "")),
+        //    price_selectors: vec![
+        //        "div.QuoteStrip-dataContainer.QuoteStrip-extendedHours > div.QuoteStrip-lastTimeAndPriceContainer > div.QuoteStrip-lastPriceStripContainer > span.QuoteStrip-lastPrice",
+        //        "div.QuoteStrip-lastTimeAndPriceContainer > div.QuoteStrip-lastPriceStripContainer > span.QuoteStrip-lastPrice",
+        //    ],
+        //    needs_exchange:false,
+        //},
+        //StockSource {
+        //    id: SourceID::WallStreetJournal,
+        //    base_url: "https://www.wsj.com/market-data/quotes/".to_string(),
+        //    url_transformer: Box::new(|base_url, stock| Ok(format!("{}{}", base_url,stock.ticker.to_uppercase()))),
+        //    price_result_transformer: Box::new(|s| s.replace("$", "")),
+        //    price_selectors: vec![
+        //        "span#quote_val",
+        //    ],
+        //    needs_exchange:false,
+        //},
+    ];
+
     let stocks = vec![
         Stock::new("ROIV","NASDAQ"),
         Stock::new("GOOG","NASDAQ"),
-        Stock::new("MSFT","NASDAQ"),
-        Stock::new("SUM","NYSE"),
-        Stock::new("SHG","NYSE"),
-        Stock::new("DNPUF","OTCMKTS"),
+        // Stock::new("MSFT","NASDAQ"),
+        // Stock::new("SUM","NYSE"),
+        // Stock::new("SHG","NYSE"),
+        // Stock::new("DNPUF","OTCMKTS"),
     ];
 
-
+    let mut rng = rand::thread_rng();
     for s in &stocks {
-        // println!("{}: {}",s.ticker,get_price_wsj(s).unwrap());
-        // println!("{}: {}",s.ticker,get_price_yahoo(s).unwrap());
-        // println!("{}: {}",s.ticker,get_price_yahoo(s).unwrap());
-        // println!("{}: {}",s.ticker,get_price_bloomberg(s).unwrap());
-        // println!("{}: {}",s.ticker,get_price_salpha(s).unwrap());
-        // println!("{}: {}",s.ticker,get_price_googfin(s).unwrap());
-        println!("{}: {}",s.ticker,get_price_robust(s,&source_map).unwrap());
-        println!("{}: {}",s.ticker,get_price_Source(s,&source).unwrap());
+        println!("{}: {}",s.ticker,get_price_robust(s,&sources).unwrap());
     }
-
-    // let fns = vec![get_price_yahoo,get_price_salpha,get_price_googfin,get_price_cnbc];
-    // for s in &stocks {
-    //     println!("{}: {}",s.ticker,stock_fn(s).unwrap());
-    // }
 }
