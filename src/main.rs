@@ -322,12 +322,6 @@ fn main() {
                         vec![r#"div.yWOrNb span[jsname="Fe7oBc"].NydbP div.JwB6zf"#.to_string()]
                     },
                     result_transformer: |result: &str| {
-                        // let re = Regex::new(r".*\((.*)\)").unwrap();
-                        // if let Some(captured) = re.captures(result) {
-                        //     if let Some(matched) = captured.get(1) {
-                        //         return matched.as_str().to_string();
-                        //     }
-                        // }
                         return result.to_string();
                     },
                 },
