@@ -8,7 +8,18 @@ cd spur
 cargo install --path .
 ```
 
-You can get the stock price of Google, for example with
+## Usage
 
-`spur goog`
+You can get the price of a stock with `spur <ticker>`, for example
 
+`spur GOOG`
+
+to get the price of Google.
+
+Stock tickers are case-insensitive. If you want to specify an exchange, you can do so with 
+
+`spur <ticker>:<exchange>`
+
+e.g. 
+
+`spur GOOG:NASDAQ`
