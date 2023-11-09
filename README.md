@@ -6,6 +6,8 @@ stock price utility in rust (spur)
 git clone https://github.com/pwl45/spur
 cd spur
 cargo install --path .
+# by default cargo installs to $HOME/.cargo/bin . This makes sure that directory is in $PATH
+grep -q "$HOME/.cargo/bin" <<< "$PATH" || export PATH="$HOME/.cargo/bin:$PATH"
 ```
 
 ## Usage
